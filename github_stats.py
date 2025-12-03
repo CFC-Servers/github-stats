@@ -5,7 +5,6 @@ import os
 from typing import Dict, List, Optional, Set, Tuple, Any, cast
 
 import aiohttp
-import requests
 
 
 ###############################################################################
@@ -24,7 +23,7 @@ class Queries(object):
         username: str,
         access_token: str,
         session: aiohttp.ClientSession,
-        max_connections: int = 10,
+        max_connections: int = 50,
     ):
         self.username = username
         self.access_token = access_token
@@ -51,18 +50,8 @@ class Queries(object):
             result = await r_async.json()
             if result is not None:
                 return result
-        except:
-            print("aiohttp failed for GraphQL query")
-            # Fall back on non-async requests
-            async with self.semaphore:
-                r_requests = requests.post(
-                    "https://api.github.com/graphql",
-                    headers=headers,
-                    json={"query": generated_query},
-                )
-                result = r_requests.json()
-                if result is not None:
-                    return result
+        except Exception as e:
+            print(f"GraphQL query failed: {e}")
         return dict()
 
     async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
@@ -97,21 +86,9 @@ class Queries(object):
                 result = await r_async.json()
                 if result is not None:
                     return result
-            except:
-                print("aiohttp failed for rest query")
-                # Fall back on non-async requests
-                async with self.semaphore:
-                    r_requests = requests.get(
-                        f"https://api.github.com/{path}",
-                        headers=headers,
-                        params=tuple(params.items()),
-                    )
-                    if r_requests.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    elif r_requests.status_code == 200:
-                        return r_requests.json()
+            except Exception as e:
+                print(f"REST query failed for {path}: {e}")
+                return dict()
         # print(f"There were too many 202s. Data for {path} will be incomplete.")
         print("There were too many 202s. Data for this repository will be incomplete.")
         return dict()
@@ -481,9 +458,13 @@ Languages:
         """
         if self._lines_changed is not None:
             return self._lines_changed
-        additions = 0
-        deletions = 0
-        for repo in await self.repos:
+        
+        repos = await self.repos
+        
+        async def fetch_repo_stats(repo: str) -> Tuple[int, int]:
+            """Fetch contributor stats for a single repo"""
+            additions = 0
+            deletions = 0
             r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
             for author_obj in r:
                 # Handle malformed response from the API by skipping this repo
@@ -498,6 +479,14 @@ Languages:
                 for week in author_obj.get("weeks", []):
                     additions += week.get("a", 0)
                     deletions += week.get("d", 0)
+            return (additions, deletions)
+        
+        # Fetch stats for all repos in parallel
+        results = await asyncio.gather(*[fetch_repo_stats(repo) for repo in repos])
+        
+        # Sum up all results
+        additions = sum(r[0] for r in results)
+        deletions = sum(r[1] for r in results)
 
         self._lines_changed = (additions, deletions)
         return self._lines_changed
@@ -511,11 +500,21 @@ Languages:
         if self._views is not None:
             return self._views
 
-        total = 0
-        for repo in await self.repos:
+        repos = await self.repos
+        
+        async def fetch_repo_views(repo: str) -> int:
+            """Fetch traffic views for a single repo"""
+            count = 0
             r = await self.queries.query_rest(f"/repos/{repo}/traffic/views")
             for view in r.get("views", []):
-                total += view.get("count", 0)
+                count += view.get("count", 0)
+            return count
+        
+        # Fetch views for all repos in parallel
+        results = await asyncio.gather(*[fetch_repo_views(repo) for repo in repos])
+        
+        # Sum up all results
+        total = sum(results)
 
         self._views = total
         return total
