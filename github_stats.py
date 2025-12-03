@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -36,7 +37,6 @@ class SimpleCache:
     def _get_cache_path(self, key: str) -> str:
         """Get the file path for a cache key"""
         # Use hash to create a safe filename
-        import hashlib
         key_hash = hashlib.md5(key.encode()).hexdigest()
         return os.path.join(self.cache_dir, f"{key_hash}.json")
     
@@ -128,7 +128,7 @@ class Queries(object):
             if result is not None:
                 return result
         except Exception as e:
-            print(f"GraphQL query failed: {e}")
+            print(f"GraphQL query failed for user {self.username}: {e}")
         return dict()
 
     async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
@@ -164,7 +164,8 @@ class Queries(object):
                 if result is not None:
                     return result
             except Exception as e:
-                print(f"REST query failed for {path}: {e}")
+                print(f"REST query failed for path '{path}': {e}")
+                # Return empty dict to allow graceful degradation
                 return dict()
         # print(f"There were too many 202s. Data for {path} will be incomplete.")
         print("There were too many 202s. Data for this repository will be incomplete.")
@@ -591,12 +592,18 @@ Languages:
                     deletions += week.get("d", 0)
             return (additions, deletions)
         
-        # Fetch stats for all repos in parallel
-        results = await asyncio.gather(*[fetch_repo_stats(repo) for repo in repos])
+        # Fetch stats for all repos in parallel with exception handling
+        results = await asyncio.gather(*[fetch_repo_stats(repo) for repo in repos], return_exceptions=True)
         
-        # Sum up all results
-        additions = sum(r[0] for r in results)
-        deletions = sum(r[1] for r in results)
+        # Sum up all results, skipping exceptions
+        additions = 0
+        deletions = 0
+        for r in results:
+            if isinstance(r, Exception):
+                print(f"Error fetching repo stats: {r}")
+                continue
+            additions += r[0]
+            deletions += r[1]
 
         self._lines_changed = (additions, deletions)
         
@@ -638,11 +645,16 @@ Languages:
                 count += view.get("count", 0)
             return count
         
-        # Fetch views for all repos in parallel
-        results = await asyncio.gather(*[fetch_repo_views(repo) for repo in repos])
+        # Fetch views for all repos in parallel with exception handling
+        results = await asyncio.gather(*[fetch_repo_views(repo) for repo in repos], return_exceptions=True)
         
-        # Sum up all results
-        total = sum(results)
+        # Sum up all results, skipping exceptions
+        total = 0
+        for r in results:
+            if isinstance(r, Exception):
+                print(f"Error fetching repo views: {r}")
+                continue
+            total += r
 
         self._views = total
         
