@@ -1,11 +1,87 @@
 #!/usr/bin/python3
 
 import asyncio
+import hashlib
+import json
 import os
+import time
 from typing import Dict, List, Optional, Set, Tuple, Any, cast
 
 import aiohttp
-import requests
+
+
+###############################################################################
+# Cache Helper
+###############################################################################
+
+
+class SimpleCache:
+    """
+    Simple file-based cache with TTL support for API responses.
+    """
+    
+    def __init__(self, cache_dir: str = ".github_stats_cache", ttl: int = 3600):
+        """
+        :param cache_dir: Directory to store cache files
+        :param ttl: Time-to-live in seconds (default: 1 hour)
+        """
+        self.cache_dir = cache_dir
+        self.ttl = ttl
+        self._ensure_cache_dir()
+    
+    def _ensure_cache_dir(self) -> None:
+        """Create cache directory if it doesn't exist"""
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
+    
+    def _get_cache_path(self, key: str) -> str:
+        """Get the file path for a cache key"""
+        # Use SHA-256 hash to create a safe filename
+        key_hash = hashlib.sha256(key.encode()).hexdigest()
+        return os.path.join(self.cache_dir, f"{key_hash}.json")
+    
+    def get(self, key: str) -> Optional[Any]:
+        """
+        Retrieve a value from cache if it exists and is not expired
+        :param key: Cache key
+        :return: Cached value or None
+        """
+        cache_path = self._get_cache_path(key)
+        if not os.path.exists(cache_path):
+            return None
+        
+        try:
+            with open(cache_path, 'r') as f:
+                data = json.load(f)
+            
+            # Check if cache is expired
+            if time.time() - data.get('timestamp', 0) > self.ttl:
+                os.remove(cache_path)
+                return None
+            
+            return data.get('value')
+        except (json.JSONDecodeError, IOError, KeyError):
+            # If cache file is corrupted, remove it
+            if os.path.exists(cache_path):
+                os.remove(cache_path)
+            return None
+    
+    def set(self, key: str, value: Any) -> None:
+        """
+        Store a value in cache
+        :param key: Cache key
+        :param value: Value to cache
+        """
+        cache_path = self._get_cache_path(key)
+        try:
+            with open(cache_path, 'w') as f:
+                json.dump({
+                    'timestamp': time.time(),
+                    'value': value
+                }, f)
+        except (IOError, TypeError):
+            # If caching fails, just continue without caching
+            pass
 
 
 ###############################################################################
@@ -24,7 +100,7 @@ class Queries(object):
         username: str,
         access_token: str,
         session: aiohttp.ClientSession,
-        max_connections: int = 10,
+        max_connections: int = 50,
     ):
         self.username = username
         self.access_token = access_token
@@ -51,18 +127,8 @@ class Queries(object):
             result = await r_async.json()
             if result is not None:
                 return result
-        except:
-            print("aiohttp failed for GraphQL query")
-            # Fall back on non-async requests
-            async with self.semaphore:
-                r_requests = requests.post(
-                    "https://api.github.com/graphql",
-                    headers=headers,
-                    json={"query": generated_query},
-                )
-                result = r_requests.json()
-                if result is not None:
-                    return result
+        except Exception as e:
+            print(f"GraphQL query failed for user {self.username}: {e}")
         return dict()
 
     async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
@@ -97,21 +163,10 @@ class Queries(object):
                 result = await r_async.json()
                 if result is not None:
                     return result
-            except:
-                print("aiohttp failed for rest query")
-                # Fall back on non-async requests
-                async with self.semaphore:
-                    r_requests = requests.get(
-                        f"https://api.github.com/{path}",
-                        headers=headers,
-                        params=tuple(params.items()),
-                    )
-                    if r_requests.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    elif r_requests.status_code == 200:
-                        return r_requests.json()
+            except Exception as e:
+                print(f"REST query failed for path '{path}': {e}")
+                # Return empty dict to allow graceful degradation
+                return dict()
         # print(f"There were too many 202s. Data for {path} will be incomplete.")
         print("There were too many 202s. Data for this repository will be incomplete.")
         return dict()
@@ -258,12 +313,19 @@ class Stats(object):
         exclude_repos: Optional[Set] = None,
         exclude_langs: Optional[Set] = None,
         ignore_forked_repos: bool = False,
+        enable_cache: bool = False,
+        cache_ttl: int = 3600,
+        include_views: bool = True,
+        include_lines_changed: bool = True,
     ):
         self.username = username
         self._ignore_forked_repos = ignore_forked_repos
         self._exclude_repos = set() if exclude_repos is None else exclude_repos
         self._exclude_langs = set() if exclude_langs is None else exclude_langs
+        self._include_views = include_views
+        self._include_lines_changed = include_lines_changed
         self.queries = Queries(username, access_token, session)
+        self.cache = SimpleCache(ttl=cache_ttl) if enable_cache else None
 
         self._name: Optional[str] = None
         self._stargazers: Optional[int] = None
@@ -454,6 +516,14 @@ Languages:
         if self._total_contributions is not None:
             return self._total_contributions
 
+        # Check cache first
+        cache_key = f"total_contributions_{self.username}"
+        if self.cache:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                self._total_contributions = cached
+                return self._total_contributions
+
         self._total_contributions = 0
         years = (
             (await self.queries.query(Queries.contrib_years()))
@@ -472,6 +542,11 @@ Languages:
             self._total_contributions += year.get("contributionCalendar", {}).get(
                 "totalContributions", 0
             )
+        
+        # Store in cache
+        if self.cache:
+            self.cache.set(cache_key, self._total_contributions)
+        
         return cast(int, self._total_contributions)
 
     @property
@@ -481,9 +556,30 @@ Languages:
         """
         if self._lines_changed is not None:
             return self._lines_changed
-        additions = 0
-        deletions = 0
-        for repo in await self.repos:
+        
+        # Return zeros if this stat is disabled
+        if not self._include_lines_changed:
+            self._lines_changed = (0, 0)
+            return self._lines_changed
+        
+        # Check cache first
+        cache_key = f"lines_changed_{self.username}"
+        if self.cache:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                self._lines_changed = tuple(cached)
+                return self._lines_changed
+        
+        repos = await self.repos
+        
+        async def fetch_repo_stats(repo: str) -> Tuple[int, int]:
+            """
+            Fetch contributor stats for a single repo.
+            :param repo: Repository name in format 'owner/name'
+            :return: Tuple of (additions, deletions) for the user
+            """
+            additions = 0
+            deletions = 0
             r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
             for author_obj in r:
                 # Handle malformed response from the API by skipping this repo
@@ -498,8 +594,27 @@ Languages:
                 for week in author_obj.get("weeks", []):
                     additions += week.get("a", 0)
                     deletions += week.get("d", 0)
+            return (additions, deletions)
+        
+        # Fetch stats for all repos in parallel with exception handling
+        results = await asyncio.gather(*[fetch_repo_stats(repo) for repo in repos], return_exceptions=True)
+        
+        # Sum up all results, skipping exceptions
+        additions = 0
+        deletions = 0
+        for r in results:
+            if isinstance(r, Exception):
+                print(f"Error fetching repo stats: {r}")
+                continue
+            additions += r[0]
+            deletions += r[1]
 
         self._lines_changed = (additions, deletions)
+        
+        # Store in cache
+        if self.cache:
+            self.cache.set(cache_key, list(self._lines_changed))
+        
         return self._lines_changed
 
     @property
@@ -511,13 +626,50 @@ Languages:
         if self._views is not None:
             return self._views
 
-        total = 0
-        for repo in await self.repos:
+        # Return zero if this stat is disabled
+        if not self._include_views:
+            self._views = 0
+            return self._views
+        
+        # Check cache first
+        cache_key = f"views_{self.username}"
+        if self.cache:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                self._views = cached
+                return self._views
+
+        repos = await self.repos
+        
+        async def fetch_repo_views(repo: str) -> int:
+            """
+            Fetch traffic views for a single repo.
+            :param repo: Repository name in format 'owner/name'
+            :return: Total view count for the last 14 days
+            """
+            count = 0
             r = await self.queries.query_rest(f"/repos/{repo}/traffic/views")
             for view in r.get("views", []):
-                total += view.get("count", 0)
+                count += view.get("count", 0)
+            return count
+        
+        # Fetch views for all repos in parallel with exception handling
+        results = await asyncio.gather(*[fetch_repo_views(repo) for repo in repos], return_exceptions=True)
+        
+        # Sum up all results, skipping exceptions
+        total = 0
+        for r in results:
+            if isinstance(r, Exception):
+                print(f"Error fetching repo views: {r}")
+                continue
+            total += r
 
         self._views = total
+        
+        # Store in cache
+        if self.cache:
+            self.cache.set(cache_key, self._views)
+        
         return total
 
 
