@@ -1,10 +1,87 @@
 #!/usr/bin/python3
 
 import asyncio
+import json
 import os
+import time
 from typing import Dict, List, Optional, Set, Tuple, Any, cast
 
 import aiohttp
+
+
+###############################################################################
+# Cache Helper
+###############################################################################
+
+
+class SimpleCache:
+    """
+    Simple file-based cache with TTL support for API responses.
+    """
+    
+    def __init__(self, cache_dir: str = ".github_stats_cache", ttl: int = 3600):
+        """
+        :param cache_dir: Directory to store cache files
+        :param ttl: Time-to-live in seconds (default: 1 hour)
+        """
+        self.cache_dir = cache_dir
+        self.ttl = ttl
+        self._ensure_cache_dir()
+    
+    def _ensure_cache_dir(self) -> None:
+        """Create cache directory if it doesn't exist"""
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
+    
+    def _get_cache_path(self, key: str) -> str:
+        """Get the file path for a cache key"""
+        # Use hash to create a safe filename
+        import hashlib
+        key_hash = hashlib.md5(key.encode()).hexdigest()
+        return os.path.join(self.cache_dir, f"{key_hash}.json")
+    
+    def get(self, key: str) -> Optional[Any]:
+        """
+        Retrieve a value from cache if it exists and is not expired
+        :param key: Cache key
+        :return: Cached value or None
+        """
+        cache_path = self._get_cache_path(key)
+        if not os.path.exists(cache_path):
+            return None
+        
+        try:
+            with open(cache_path, 'r') as f:
+                data = json.load(f)
+            
+            # Check if cache is expired
+            if time.time() - data.get('timestamp', 0) > self.ttl:
+                os.remove(cache_path)
+                return None
+            
+            return data.get('value')
+        except (json.JSONDecodeError, IOError, KeyError):
+            # If cache file is corrupted, remove it
+            if os.path.exists(cache_path):
+                os.remove(cache_path)
+            return None
+    
+    def set(self, key: str, value: Any) -> None:
+        """
+        Store a value in cache
+        :param key: Cache key
+        :param value: Value to cache
+        """
+        cache_path = self._get_cache_path(key)
+        try:
+            with open(cache_path, 'w') as f:
+                json.dump({
+                    'timestamp': time.time(),
+                    'value': value
+                }, f)
+        except (IOError, TypeError):
+            # If caching fails, just continue without caching
+            pass
 
 
 ###############################################################################
@@ -235,12 +312,19 @@ class Stats(object):
         exclude_repos: Optional[Set] = None,
         exclude_langs: Optional[Set] = None,
         ignore_forked_repos: bool = False,
+        enable_cache: bool = False,
+        cache_ttl: int = 3600,
+        include_views: bool = True,
+        include_lines_changed: bool = True,
     ):
         self.username = username
         self._ignore_forked_repos = ignore_forked_repos
         self._exclude_repos = set() if exclude_repos is None else exclude_repos
         self._exclude_langs = set() if exclude_langs is None else exclude_langs
+        self._include_views = include_views
+        self._include_lines_changed = include_lines_changed
         self.queries = Queries(username, access_token, session)
+        self.cache = SimpleCache(ttl=cache_ttl) if enable_cache else None
 
         self._name: Optional[str] = None
         self._stargazers: Optional[int] = None
@@ -431,6 +515,14 @@ Languages:
         if self._total_contributions is not None:
             return self._total_contributions
 
+        # Check cache first
+        cache_key = f"total_contributions_{self.username}"
+        if self.cache:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                self._total_contributions = cached
+                return self._total_contributions
+
         self._total_contributions = 0
         years = (
             (await self.queries.query(Queries.contrib_years()))
@@ -449,6 +541,11 @@ Languages:
             self._total_contributions += year.get("contributionCalendar", {}).get(
                 "totalContributions", 0
             )
+        
+        # Store in cache
+        if self.cache:
+            self.cache.set(cache_key, self._total_contributions)
+        
         return cast(int, self._total_contributions)
 
     @property
@@ -458,6 +555,19 @@ Languages:
         """
         if self._lines_changed is not None:
             return self._lines_changed
+        
+        # Return zeros if this stat is disabled
+        if not self._include_lines_changed:
+            self._lines_changed = (0, 0)
+            return self._lines_changed
+        
+        # Check cache first
+        cache_key = f"lines_changed_{self.username}"
+        if self.cache:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                self._lines_changed = tuple(cached)
+                return self._lines_changed
         
         repos = await self.repos
         
@@ -489,6 +599,11 @@ Languages:
         deletions = sum(r[1] for r in results)
 
         self._lines_changed = (additions, deletions)
+        
+        # Store in cache
+        if self.cache:
+            self.cache.set(cache_key, list(self._lines_changed))
+        
         return self._lines_changed
 
     @property
@@ -499,6 +614,19 @@ Languages:
         """
         if self._views is not None:
             return self._views
+
+        # Return zero if this stat is disabled
+        if not self._include_views:
+            self._views = 0
+            return self._views
+        
+        # Check cache first
+        cache_key = f"views_{self.username}"
+        if self.cache:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                self._views = cached
+                return self._views
 
         repos = await self.repos
         
@@ -517,6 +645,11 @@ Languages:
         total = sum(results)
 
         self._views = total
+        
+        # Store in cache
+        if self.cache:
+            self.cache.set(cache_key, self._views)
+        
         return total
 
 
