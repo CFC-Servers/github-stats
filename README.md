@@ -97,7 +97,7 @@ For more information on inaccuracies, see issue
      workflow](https://github.com/jstrieb/github-stats/blob/master/.github/workflows/main.yml))
      called `EXCLUDE_FORKED_REPOS` with a value of `true`.
    - To generate statistics for a GitHub organization, add a new secret called
-     `GITHUB_ORG` with the name of the organization. Note that when this is set,
+     `ORGANIZATION_NAME` with the name of the organization. Note that when this is set,
      the statistics will be for the organization and not the user. Also, the
      `total_contributions`, `lines_changed`, and `views` statistics are not
      displayed for organizations.
