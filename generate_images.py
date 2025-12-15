@@ -38,10 +38,17 @@ async def generate_overview(s: Stats) -> None:
     output = re.sub("{{ name }}", await s.name, output)
     output = re.sub("{{ stars }}", f"{await s.stargazers:,}", output)
     output = re.sub("{{ forks }}", f"{await s.forks:,}", output)
-    output = re.sub("{{ contributions }}", f"{await s.total_contributions:,}", output)
-    changed = (await s.lines_changed)[0] + (await s.lines_changed)[1]
-    output = re.sub("{{ lines_changed }}", f"{changed:,}", output)
-    output = re.sub("{{ views }}", f"{await s.views:,}", output)
+    
+    # Conditional replacement for organization stats
+    if s.org_name:
+        output = re.sub(r"{{ contributions }}", "", output)
+        output = re.sub(r"{{ lines_changed }}", "", output)
+        output = re.sub(r"{{ views }}", "", output)
+    else:
+        output = re.sub("{{ contributions }}", f"{await s.total_contributions:,}", output)
+        changed = (await s.lines_changed)[0] + (await s.lines_changed)[1]
+        output = re.sub("{{ lines_changed }}", f"{changed:,}", output)
+        output = re.sub("{{ views }}", f"{await s.views:,}", output)
     output = re.sub("{{ repos }}", f"{len(await s.repos):,}", output)
 
     generate_output_folder()
@@ -106,6 +113,7 @@ async def main() -> None:
     user = os.getenv("GITHUB_ACTOR")
     if user is None:
         raise RuntimeError("Environment variable GITHUB_ACTOR must be set.")
+    org = os.getenv("GITHUB_ORG")
     exclude_repos = os.getenv("EXCLUDED")
     excluded_repos = (
         {x.strip() for x in exclude_repos.split(",")} if exclude_repos else None
@@ -128,6 +136,7 @@ async def main() -> None:
             exclude_repos=excluded_repos,
             exclude_langs=excluded_langs,
             ignore_forked_repos=ignore_forked_repos,
+            org_name=org,
         )
         await asyncio.gather(generate_languages(s), generate_overview(s))
 

@@ -253,6 +253,52 @@ class Queries(object):
 """
 
     @staticmethod
+    def repos_overview_org(
+        org_name: str, owned_cursor: Optional[str] = None
+    ) -> str:
+        """
+        :param org_name: GitHub organization name
+        :param owned_cursor: GraphQL cursor for pagination
+        :return: GraphQL query with overview of organization repositories
+        """
+        return f"""query {{
+  organization(login: "{org_name}") {{
+    login,
+    name,
+    repositories(
+        first: 100,
+        orderBy: {{
+            field: UPDATED_AT,
+            direction: DESC
+        }},
+        after: {"null" if owned_cursor is None else '"'+ owned_cursor +'"'}
+    ) {{
+      pageInfo {{
+        hasNextPage
+        endCursor
+      }}
+      nodes {{
+        nameWithOwner
+        stargazers {{
+          totalCount
+        }}
+        forkCount
+        languages(first: 10, orderBy: {{field: SIZE, direction: DESC}}) {{
+          edges {{
+            size
+            node {{
+              name
+              color
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}
+"""
+
+    @staticmethod
     def contrib_years() -> str:
         """
         :return: GraphQL query to get all years the user has been a contributor
@@ -317,6 +363,7 @@ class Stats(object):
         cache_ttl: int = 3600,
         include_views: bool = True,
         include_lines_changed: bool = True,
+        org_name: Optional[str] = None,
     ):
         self.username = username
         self._ignore_forked_repos = ignore_forked_repos
@@ -326,6 +373,7 @@ class Stats(object):
         self._include_lines_changed = include_lines_changed
         self.queries = Queries(username, access_token, session)
         self.cache = SimpleCache(ttl=cache_ttl) if enable_cache else None
+        self.org_name = org_name
 
         self._name: Optional[str] = None
         self._stargazers: Optional[int] = None
@@ -371,29 +419,52 @@ Languages:
         next_owned = None
         next_contrib = None
         while True:
-            raw_results = await self.queries.query(
-                Queries.repos_overview(
-                    owned_cursor=next_owned, contrib_cursor=next_contrib
+            if self.org_name:
+                raw_results = await self.queries.query(
+                    Queries.repos_overview_org(
+                        org_name=self.org_name, owned_cursor=next_owned
+                    )
                 )
-            )
+            else:
+                raw_results = await self.queries.query(
+                    Queries.repos_overview(
+                        owned_cursor=next_owned, contrib_cursor=next_contrib
+                    )
+                )
             raw_results = raw_results if raw_results is not None else {}
 
-            self._name = raw_results.get("data", {}).get("viewer", {}).get("name", None)
-            if self._name is None:
-                self._name = (
+            if self.org_name:
+                self._name = raw_results.get("data", {}).get("organization", {}).get("name", None)
+                if self._name is None:
+                    self._name = (
+                        raw_results.get("data", {})
+                        .get("organization", {})
+                        .get("login", "No Name")
+                    )
+                
+                owned_repos = (
+                    raw_results.get("data", {})
+                    .get("organization", {})
+                    .get("repositories", {})
+                )
+                contrib_repos = {}
+            else:
+                self._name = raw_results.get("data", {}).get("viewer", {}).get("name", None)
+                if self._name is None:
+                    self._name = (
+                        raw_results.get("data", {})
+                        .get("viewer", {})
+                        .get("login", "No Name")
+                    )
+
+                contrib_repos = (
                     raw_results.get("data", {})
                     .get("viewer", {})
-                    .get("login", "No Name")
+                    .get("repositoriesContributedTo", {})
                 )
-
-            contrib_repos = (
-                raw_results.get("data", {})
-                .get("viewer", {})
-                .get("repositoriesContributedTo", {})
-            )
-            owned_repos = (
-                raw_results.get("data", {}).get("viewer", {}).get("repositories", {})
-            )
+                owned_repos = (
+                    raw_results.get("data", {}).get("viewer", {}).get("repositories", {})
+                )
 
             repos = owned_repos.get("nodes", [])
             if not self._ignore_forked_repos:
@@ -424,7 +495,16 @@ Languages:
                             "color": lang.get("node", {}).get("color"),
                         }
 
-            if owned_repos.get("pageInfo", {}).get(
+            if self.org_name:
+                if owned_repos.get("pageInfo", {}).get(
+                    "hasNextPage", False
+                ):
+                    next_owned = owned_repos.get("pageInfo", {}).get(
+                        "endCursor", next_owned
+                    )
+                else:
+                    break
+            elif owned_repos.get("pageInfo", {}).get(
                 "hasNextPage", False
             ) or contrib_repos.get("pageInfo", {}).get("hasNextPage", False):
                 next_owned = owned_repos.get("pageInfo", {}).get(
@@ -515,6 +595,8 @@ Languages:
         """
         if self._total_contributions is not None:
             return self._total_contributions
+        if self.org_name:
+            return 0
 
         # Check cache first
         cache_key = f"total_contributions_{self.username}"
